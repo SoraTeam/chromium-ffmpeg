@@ -1,0 +1,81 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 30,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-x86-clang13",
+      "displayName": "Windows x86: Chromium config Clang 13 revision, MSVC 14.26 / SDK 19041",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/out/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER_TARGET": "i686-pc-windows-msvc",
+        "CMAKE_LINKER_TYPE": "LLD",
+        "CMAKE_MSVC_RUNTIME_LIBRARY": "MultiThreaded",
+        "CMAKE_INSTALL_PREFIX": "${sourceDir}/out/package/${presetName}",
+        "FFMPEG_BRANDING": "Chrome"
+      },
+      "architecture": {
+        "value": "x86",
+        "strategy": "external"
+      },
+      "toolset": {
+        "value": "host=x64",
+        "strategy": "external"
+      },
+      "toolchainFile": "${sourceDir}/cmake/toolchains/chromium-config-clang13.cmake"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-x86-clang13",
+      "configurePreset": "windows-x86-clang13"
+    },
+    {
+      "name": "windows-x86-clang13-install",
+      "configurePreset": "windows-x86-clang13",
+      "targets": [
+        "install"
+      ]
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "windows-x86-clang13",
+      "configurePreset": "windows-x86-clang13",
+      "output": {
+        "outputOnFailure": true
+      },
+      "execution": {
+        "noTestsAction": "error"
+      }
+    }
+  ],
+  "workflowPresets": [
+    {
+      "name": "windows-x86-clang13",
+      "steps": [
+        {
+          "type": "configure",
+          "name": "windows-x86-clang13"
+        },
+        {
+          "type": "build",
+          "name": "windows-x86-clang13"
+        },
+        {
+          "type": "test",
+          "name": "windows-x86-clang13"
+        },
+        {
+          "type": "build",
+          "name": "windows-x86-clang13-install"
+        }
+      ]
+    }
+  ]
+}

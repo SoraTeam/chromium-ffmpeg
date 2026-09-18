@@ -1,6 +1,10 @@
 FFmpeg README
 =============
 
+**Windows 独立 DLL 构建：** 参见 [WINDOWS.md](WINDOWS.md)。执行
+`cmake --workflow --preset windows-x86-clang13`，使用 Chromium 原始配置、
+`CHROMIUM_NO_LOGGING` 和 ThinLTO 构建、测试并打包 32 位 `ffmpeg.dll`。
+
 FFmpeg is a collection of libraries and tools to process multimedia content
 such as audio, video, subtitles and related metadata.
 

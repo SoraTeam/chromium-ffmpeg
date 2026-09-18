@@ -1,0 +1,48 @@
+name: Windows FFmpeg
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ffmpeg-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install historical Windows headers and libraries
+        shell: cmd
+        env:
+          TEMP: ${{ runner.temp }}
+          TMP: ${{ runner.temp }}
+        run: cmake -P cmake/InstallHistoricalSysroot.cmake
+      - name: Build and test
+        shell: cmd
+        run: |
+          call "%RUNNER_TEMP%\ffmpeg-vs2019\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x86 -host_arch=x64 -vcvars_ver=14.26.28801 -winsdk=10.0.19041.0
+          if errorlevel 1 exit /b 1
+          cmake --workflow --preset windows-x86-clang13
+      - name: Upload binaries and symbols
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: ffmpeg-windows-x86-clang13-${{ github.sha }}
+          path: out/package/windows-x86-clang13/
+          if-no-files-found: error
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: diagnostics-windows-x86-clang13
+          path: |
+            out/windows-x86-clang13/CMakeFiles/CMakeConfigureLog.yaml
+            out/windows-x86-clang13/Testing/Temporary/LastTest.log
+            ${{ runner.temp }}/dd_*.log
+          if-no-files-found: ignore
