@@ -75,7 +75,8 @@ string(APPEND export_checks "CHECK(export_directory->NumberOfNames == ${export_c
 file(CONFIGURE OUTPUT "${PROJECT_BINARY_DIR}/ffmpeg.def" CONTENT "${exports}" @ONLY)
 file(CONFIGURE OUTPUT "${PROJECT_BINARY_DIR}/export_checks.h" CONTENT "${export_checks}" @ONLY)
 
-add_library(ffmpeg SHARED ${ffmpeg_c_sources} ${ffmpeg_asm_sources} "${PROJECT_BINARY_DIR}/ffmpeg.def")
+add_library(ffmpeg SHARED ${ffmpeg_c_sources} ${ffmpeg_asm_sources}
+  chromium/mtrr_popup.c "${PROJECT_BINARY_DIR}/ffmpeg.def")
 target_link_libraries(ffmpeg PRIVATE opus)
 target_include_directories(ffmpeg PRIVATE "${platform_config}" "${PROJECT_SOURCE_DIR}")
 target_compile_definitions(ffmpeg PRIVATE
