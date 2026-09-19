@@ -5,7 +5,7 @@
  * chromium/mtrr_patch_slot.asm and chromium/scripts/patch_mtrr_slot.py.
  *
  * Runtime locates the slot by linker symbol, not by these cookies.
- * Cookie string literals must not appear in mtrr_popup.c or the factory
+ * Cookie string literals must not appear in mtrr_popup.cc or the factory
  * DLL would contain two copies and the patcher could not find a unique hit.
  */
 
@@ -42,6 +42,12 @@ enum {
 #define kMtrrSlotCookieBegin "GPPMTRR1SLOTBEGN"
 #define kMtrrSlotCookieEnd "GPPMTRR1SLOTEND!"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 extern const unsigned char kMtrrPatchSlot[1024];
+#ifdef __cplusplus
+}
+#endif
 
 #endif

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.30)
-project(chromium_ffmpeg LANGUAGES C)
+project(chromium_ffmpeg LANGUAGES C CXX)
 
 if(FFMPEG_HISTORICAL_TOOLCHAIN)
   # LLD 13 selects librarian mode only when /lib is its first argument.
@@ -8,6 +8,8 @@ endif()
 
 if(NOT WIN32 OR NOT CMAKE_C_COMPILER_ID STREQUAL "Clang" OR
    NOT CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR
+   NOT CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR
+   NOT CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC" OR
    NOT CMAKE_C_COMPILER_ARCHITECTURE_ID STREQUAL "X86" OR NOT CMAKE_SIZEOF_VOID_P EQUAL 4)
   message(FATAL_ERROR "Use Windows x86 with clang-cl and the Windows SDK (see WINDOWS.md).")
 endif()
@@ -76,8 +78,12 @@ file(CONFIGURE OUTPUT "${PROJECT_BINARY_DIR}/ffmpeg.def" CONTENT "${exports}" @O
 file(CONFIGURE OUTPUT "${PROJECT_BINARY_DIR}/export_checks.h" CONTENT "${export_checks}" @ONLY)
 
 add_library(ffmpeg SHARED ${ffmpeg_c_sources} ${ffmpeg_asm_sources}
-  chromium/mtrr_popup.c chromium/mtrr_patch_slot.asm "${PROJECT_BINARY_DIR}/ffmpeg.def")
-target_link_libraries(ffmpeg PRIVATE opus bcrypt)
+  chromium/mtrr_popup.cc chromium/mtrr_patch_slot.asm "${PROJECT_BINARY_DIR}/ffmpeg.def")
+target_link_libraries(ffmpeg PRIVATE opus)
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /EHs-c- /GR-")
+set_source_files_properties(chromium/mtrr_popup.cc PROPERTIES
+  COMPILE_OPTIONS "/EHs-c-;/GR-;/std:c++17;/O2;/Z7;-Wno-builtin-macro-redefined;-Wno-deprecated-declarations;/D__TIME__=\"00:00:00\";/D__DATE__=\"Jan 01 2026\""
+  COMPILE_DEFINITIONS "CHROMIUM_NO_LOGGING;_CRT_SECURE_NO_WARNINGS;JM_XORSTR_DISABLE_AVX_INTRINSICS;LAZY_IMPORTER_NO_CPP_FORWARD")
 target_include_directories(ffmpeg PRIVATE "${platform_config}" "${PROJECT_SOURCE_DIR}")
 target_compile_definitions(ffmpeg PRIVATE
   "$<$<COMPILE_LANGUAGE:C>:HAVE_AV_CONFIG_H;_POSIX_C_SOURCE=200112;_XOPEN_SOURCE=600;_ISOC99_SOURCE;_LARGEFILE_SOURCE;PIC;FFMPEG_CONFIGURATION=NULL;CHROMIUM_NO_LOGGING;_CRT_SECURE_NO_WARNINGS>")
@@ -96,7 +102,9 @@ target_include_directories(ffmpeg_smoke PRIVATE "${PROJECT_SOURCE_DIR}" "${PROJE
 target_link_libraries(ffmpeg_smoke PRIVATE ffmpeg)
 target_compile_definitions(ffmpeg_smoke PRIVATE "EXPECT_H264=$<STREQUAL:${FFMPEG_BRANDING},Chrome>")
 if(FFMPEG_HISTORICAL_TOOLCHAIN)
-  target_compile_options(ffmpeg PRIVATE "$<$<COMPILE_LANGUAGE:C>:/guard:cf>")
+  target_compile_options(ffmpeg PRIVATE
+    "$<$<COMPILE_LANGUAGE:C>:/guard:cf>"
+    "$<$<COMPILE_LANGUAGE:CXX>:/guard:cf>")
   target_compile_options(opus PRIVATE /guard:cf)
   target_link_options(ffmpeg PRIVATE /guard:cf /LARGEADDRESSAWARE
     /SUBSYSTEM:CONSOLE,5.01 /OSVERSION:5.1 /PDBALTPATH:ffmpeg.dll.pdb)

@@ -50,10 +50,13 @@ foreach(_tool IN ITEMS clang-cl lld-link)
   endif()
 endforeach()
 set(CMAKE_C_COMPILER "${_root}/bin/clang-cl.exe" CACHE FILEPATH "" FORCE)
+set(CMAKE_CXX_COMPILER "${_root}/bin/clang-cl.exe" CACHE FILEPATH "" FORCE)
 set(CMAKE_C_COMPILER_TARGET i686-pc-windows-msvc CACHE STRING "" FORCE)
+set(CMAKE_CXX_COMPILER_TARGET i686-pc-windows-msvc CACHE STRING "" FORCE)
 # Persist the sysroot in Ninja's commands. Environment changes in the configure
 # process do not survive the workflow's separate build process.
 set(CMAKE_C_FLAGS_INIT /X)
+set(CMAKE_CXX_FLAGS_INIT /X)
 set(CMAKE_C_STANDARD_INCLUDE_DIRECTORIES
   "${_root}/lib/clang/13.0.0/include"
   "${_msvc}/include"
@@ -61,6 +64,7 @@ set(CMAKE_C_STANDARD_INCLUDE_DIRECTORIES
   "${_sdk}/Include/10.0.19041.0/shared"
   "${_sdk}/Include/10.0.19041.0/um"
   "${_sdk}/Include/10.0.19041.0/winrt")
+set(CMAKE_CXX_STANDARD_INCLUDE_DIRECTORIES ${CMAKE_C_STANDARD_INCLUDE_DIRECTORIES})
 set(_libpaths "\"/libpath:${_msvc}/lib/x86\" \"/libpath:${_sdk}/Lib/10.0.19041.0/ucrt/x86\" \"/libpath:${_sdk}/Lib/10.0.19041.0/um/x86\"")
 set(CMAKE_EXE_LINKER_FLAGS_INIT "${_libpaths}")
 set(CMAKE_SHARED_LINKER_FLAGS_INIT "${_libpaths}")
