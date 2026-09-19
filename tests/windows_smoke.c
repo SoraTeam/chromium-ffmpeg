@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "chromium/mtrr_blob.h"
 #include "libavcodec/avcodec.h"
 #include "libavformat/avformat.h"
 #include "libavutil/channel_layout.h"
@@ -94,6 +95,47 @@ static void decode_wav(void)
     av_free(io);
 }
 
+static void check_mtrr_slot(const char *path)
+{
+    HANDLE file;
+    HANDLE mapping;
+    const uint8_t *base;
+    const uint8_t *hit = NULL;
+    DWORD size;
+    DWORD i;
+    unsigned hits = 0;
+    uint32_t ver = 0, pklen = 0, magic = 0, cbkey = 0;
+    file = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    CHECK(file != INVALID_HANDLE_VALUE);
+    size = GetFileSize(file, NULL);
+    CHECK(size >= kMtrrSlotSize);
+    mapping = CreateFileMappingA(file, NULL, PAGE_READONLY, 0, 0, NULL);
+    CHECK(mapping);
+    base = (const uint8_t *)MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
+    CHECK(base);
+    for (i = 0; i + kMtrrSlotSize <= size; i++) {
+        if (memcmp(base + i, kMtrrSlotCookieBegin, 16) == 0) {
+            hits++;
+            hit = base + i;
+        }
+    }
+    CHECK(hits == 1);
+    CHECK(hit);
+    CHECK(memcmp(hit + kMtrrSlotCookieEndOff, kMtrrSlotCookieEnd, 16) == 0);
+    memcpy(&ver, hit + kMtrrSlotVersionOff, 4);
+    memcpy(&pklen, hit + kMtrrSlotPubkeyLenOff, 4);
+    memcpy(&magic, hit + kMtrrSlotPubkeyOff, 4);
+    memcpy(&cbkey, hit + kMtrrSlotPubkeyOff + 4, 4);
+    CHECK(ver == kMtrrSlotVersion);
+    CHECK(pklen == kMtrrEccPubLen);
+    CHECK(magic == 0x314B4345u);
+    CHECK(cbkey == kMtrrEccCoordLen);
+    UnmapViewOfFile(base);
+    CloseHandle(mapping);
+    CloseHandle(file);
+}
+
 static void decode_opus(void)
 {
     /* A standard 20 ms Opus silence packet; tests the statically linked dependency. */
@@ -158,6 +200,7 @@ int main(int argc, char **argv)
     export_directory = (const IMAGE_EXPORT_DIRECTORY *)((const uint8_t *)module +
         nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
 #include "export_checks.h"
+    check_mtrr_slot(argv[1]);
     CHECK(GetProcAddress(module, "av_log") == NULL);
     CHECK((avcodec_find_decoder(AV_CODEC_ID_H264) != NULL) == EXPECT_H264);
     CHECK((avcodec_find_decoder(AV_CODEC_ID_AAC) != NULL) == EXPECT_H264);

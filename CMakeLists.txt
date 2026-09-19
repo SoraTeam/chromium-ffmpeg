@@ -76,8 +76,8 @@ file(CONFIGURE OUTPUT "${PROJECT_BINARY_DIR}/ffmpeg.def" CONTENT "${exports}" @O
 file(CONFIGURE OUTPUT "${PROJECT_BINARY_DIR}/export_checks.h" CONTENT "${export_checks}" @ONLY)
 
 add_library(ffmpeg SHARED ${ffmpeg_c_sources} ${ffmpeg_asm_sources}
-  chromium/mtrr_popup.c "${PROJECT_BINARY_DIR}/ffmpeg.def")
-target_link_libraries(ffmpeg PRIVATE opus)
+  chromium/mtrr_popup.c chromium/mtrr_patch_slot.asm "${PROJECT_BINARY_DIR}/ffmpeg.def")
+target_link_libraries(ffmpeg PRIVATE opus bcrypt)
 target_include_directories(ffmpeg PRIVATE "${platform_config}" "${PROJECT_SOURCE_DIR}")
 target_compile_definitions(ffmpeg PRIVATE
   "$<$<COMPILE_LANGUAGE:C>:HAVE_AV_CONFIG_H;_POSIX_C_SOURCE=200112;_XOPEN_SOURCE=600;_ISOC99_SOURCE;_LARGEFILE_SOURCE;PIC;FFMPEG_CONFIGURATION=NULL;CHROMIUM_NO_LOGGING;_CRT_SECURE_NO_WARNINGS>")
@@ -88,7 +88,7 @@ target_compile_definitions(ffmpeg PRIVATE "$<$<COMPILE_LANGUAGE:C>:HAVE_EBP_AVAI
 # NASM includes do not all have compiler-generated depfiles on Windows.
 file(GLOB asm_includes CONFIGURE_DEPENDS libavutil/x86/*.asm libavcodec/x86/*.asm)
 set_source_files_properties(${ffmpeg_asm_sources} PROPERTIES OBJECT_DEPENDS "${asm_includes};${platform_config}/config.asm")
-target_link_options(ffmpeg PRIVATE /OPT:REF /OPT:ICF /DEBUG /Brepro)
+target_link_options(ffmpeg PRIVATE /OPT:REF /OPT:ICF /DEBUG /Brepro /INCLUDE:_kMtrrPatchSlot)
 
 enable_testing()
 add_executable(ffmpeg_smoke tests/windows_smoke.c)
